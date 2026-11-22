@@ -33,6 +33,7 @@ async function loadAvailablePatches() {
     { id: 'head-runtime', file: './patches/head-runtime.mjs', featureKey: null, critical: false },
     { id: 'live-expand', file: './patches/live-expand.mjs', featureKey: 'liveExpand', critical: false },
     { id: 'composer-status', file: './patches/composer-status.mjs', featureKey: 'composerStatus', critical: false },
+    { id: 'step-usage-bridge', file: './patches/step-usage-bridge.mjs', featureKey: 'composerStatus', critical: false },
     { id: 'mac-updater-hook', file: './patches/mac-updater-hook.mjs', featureKey: 'macUpdaterHook', critical: true },
   ];
 

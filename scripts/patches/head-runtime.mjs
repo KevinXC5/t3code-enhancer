@@ -663,15 +663,49 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
     if (typeof val === 'number') return Number.isFinite(val) ? val : NaN;
     if (typeof val === 'string') return Date.parse(val);
     if (typeof val === 'object') {
-      if (typeof val.epochMillis === 'number') return val.epochMillis;
+      // Effect DateTime.Utc / DateTime.Zoned 使用 epochMilliseconds 字段与 toJSON()
+      if (typeof val.epochMilliseconds === 'number' && Number.isFinite(val.epochMilliseconds)) return val.epochMilliseconds;
+      if (typeof val.epochMillis === 'number' && Number.isFinite(val.epochMillis)) return val.epochMillis;
       if (typeof val.getTime === 'function') return val.getTime();
+      if (typeof val.toJSON === 'function') {
+        const j = val.toJSON();
+        if (typeof j === 'string') {
+          const parsed = Date.parse(j);
+          if (Number.isFinite(parsed)) return parsed;
+        }
+      }
       if (typeof val.toISOString === 'function') return Date.parse(val.toISOString());
       if (typeof val.toString === 'function') {
         const s = val.toString();
-        if (s && s !== '[object Object]') return Date.parse(s);
+        if (s && s !== '[object Object]') {
+          const unwrapped = s.replace(/^DateTime\.(?:Utc|Zoned)\((.+)\)$/, '$1');
+          return Date.parse(unwrapped);
+        }
       }
     }
     return NaN;
+  }
+
+  // 合并重叠时间区间，避免并行工具调用被重复累加耗时
+  function sumMergedIntervals(intervals) {
+    if (!intervals || intervals.length === 0) return 0;
+    if (intervals.length === 1) return Math.max(0, intervals[0][1] - intervals[0][0]);
+    intervals.sort((a, b) => a[0] - b[0]);
+    let total = 0;
+    let curStart = intervals[0][0];
+    let curEnd = intervals[0][1];
+    for (let i = 1; i < intervals.length; i++) {
+      const [s, e] = intervals[i];
+      if (s <= curEnd) {
+        if (e > curEnd) curEnd = e;
+      } else {
+        total += curEnd - curStart;
+        curStart = s;
+        curEnd = e;
+      }
+    }
+    total += curEnd - curStart;
+    return total;
   }
 
   function getOrCreateTelemetry(key) {
@@ -683,11 +717,17 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
         model: null,
         providerInstanceId: null,
         turnCount: null,
+        lastKnownMaxTokens: null,
         lastRunsRef: null,
         lastTurnsRef: null,
         lastNodesRef: null,
         lastItemsRef: null,
         agg: null, // 由 providerTurns / nodes / runs / items 聚合出的真实明细
+        stepTracker: {
+          seen: new Set(),
+          samples: [], // [{ turnId, input, cached, output, pct, at }]
+          liveByTurn: new Map(), // turnId -> { input, cached, output, lastPct, lastUsage }
+        },
         prevOutputTokens: null,
         prevUpdatedAtMs: null,
         exactRate: null,
@@ -785,37 +825,121 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
     let totalTurnDurationMs = 0;
     let lastCompletedAtMs = 0;
     let lastTurnCachedPct = null;
+    let latestStepTokenUsage = null;
+    let latestStepAtMs = 0;
+    let latestTurnTokenUsagePct = null;
+
+    const tracker = st.stepTracker;
 
     if (turns && turns.length > 0) {
       for (let i = 0; i < turns.length; i++) {
         const turn = turns[i];
         if (!turn || turn.promptDropped === true) continue;
+        const turnId = String(turn.id || ('idx:' + i));
         const sMs = toEpochMs(turn.startedAt);
         const eMs = toEpochMs(turn.completedAt);
         const dur = Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs ? eMs - sMs : 0;
         if (dur > 0) totalTurnDurationMs += dur;
         if (Number.isFinite(eMs) && eMs > lastCompletedAtMs) lastCompletedAtMs = eMs;
 
-        const tu = turn.turnTokenUsage;
-        if (tu && typeof tu === 'object') {
+        // 1. 捕获步级原生 tokenUsage（Claude / Codex / OpenCode 原生每步更新，Antigravity 由服务端 step-usage-bridge 实时桥接）
+        const stepTu = turn.tokenUsage;
+        const hasFinalTu =
+          turn.turnTokenUsage &&
+          typeof turn.turnTokenUsage === 'object' &&
+          ((Number.isFinite(turn.turnTokenUsage.inputTokens) && turn.turnTokenUsage.inputTokens > 0) ||
+            (Number.isFinite(turn.turnTokenUsage.outputTokens) && turn.turnTokenUsage.outputTokens > 0) ||
+            (Number.isFinite(turn.turnTokenUsage.cachedInputTokens) && turn.turnTokenUsage.cachedInputTokens > 0));
+
+        if (stepTu && typeof stepTu === 'object') {
+          const stepAt = toEpochMs(stepTu.updatedAt);
+          if (Number.isFinite(stepTu.maxTokens) && stepTu.maxTokens > 0) {
+            st.lastKnownMaxTokens = stepTu.maxTokens;
+          }
+          if (!latestStepTokenUsage || (Number.isFinite(stepAt) && stepAt >= latestStepAtMs)) {
+            latestStepTokenUsage = stepTu;
+            if (Number.isFinite(stepAt)) latestStepAtMs = stepAt;
+          }
+          const sInp = Number.isFinite(stepTu.inputTokens) ? stepTu.inputTokens : 0;
+          const sCached = Number.isFinite(stepTu.cachedInputTokens) ? stepTu.cachedInputTokens : 0;
+          const sOut = Number.isFinite(stepTu.outputTokens) ? stepTu.outputTokens : 0;
+          if (sInp > 0) {
+            const sPct = Math.max(0, Math.min(100, Math.round((sCached / sInp) * 100)));
+            latestTurnTokenUsagePct = sPct;
+            const dedupKey = turnId + '|' + (stepTu.updatedAt || '') + '|' + sInp + '|' + sCached + '|' + sOut;
+            if (!tracker.seen.has(dedupKey)) {
+              tracker.seen.add(dedupKey);
+              trimSet(tracker.seen, 1024);
+              tracker.samples.push({
+                turnId,
+                input: sInp,
+                cached: sCached,
+                output: sOut,
+                pct: sPct,
+                at: Number.isFinite(stepAt) ? stepAt : Date.now(),
+              });
+              if (tracker.samples.length > 512) tracker.samples.shift();
+
+              if (!hasFinalTu) {
+                let live = tracker.liveByTurn.get(turnId);
+                if (!live) {
+                  live = { input: 0, cached: 0, output: 0, lastPct: sPct };
+                  tracker.liveByTurn.set(turnId, live);
+                }
+                live.input += sInp;
+                live.cached += sCached;
+                live.output += sOut;
+                live.lastPct = sPct;
+              }
+            }
+          }
+        }
+
+        // 2. 汇总已完成回合的权威 turnTokenUsage；仍在运行中的回合用步级实时累计值补齐
+        if (hasFinalTu) {
+          // 回合已结算，清理运行期步级临时累计避免重复计数
+          tracker.liveByTurn.delete(turnId);
+          const tu = turn.turnTokenUsage;
           const inp = Number.isFinite(tu.inputTokens) ? tu.inputTokens : 0;
           const out = Number.isFinite(tu.outputTokens) ? tu.outputTokens : 0;
           const cRead = Number.isFinite(tu.cachedInputTokens) ? tu.cachedInputTokens : 0;
           const cWrite = Number.isFinite(tu.cacheCreationTokens) ? tu.cacheCreationTokens : 0;
           const reas = Number.isFinite(tu.reasoningTokens) ? tu.reasoningTokens : 0;
-          if (inp > 0 || out > 0 || cRead > 0 || cWrite > 0) {
+          hasTurnUsage = true;
+          totalInput += inp;
+          totalOutput += out;
+          totalCachedRead += cRead;
+          totalCacheWrite += cWrite;
+          totalReasoning += reas;
+          if (inp > 0 && cRead >= 0) {
+            lastTurnCachedPct = Math.max(0, Math.min(100, Math.round((cRead / inp) * 100)));
+          }
+        } else {
+          const live = tracker.liveByTurn.get(turnId);
+          if (live && (live.input > 0 || live.output > 0)) {
             hasTurnUsage = true;
-            totalInput += inp;
-            totalOutput += out;
-            totalCachedRead += cRead;
-            totalCacheWrite += cWrite;
-            totalReasoning += reas;
-            if (inp > 0 && cRead >= 0) {
-              lastTurnCachedPct = Math.max(0, Math.min(100, Math.round((cRead / inp) * 100)));
-            }
+            totalInput += live.input;
+            totalCachedRead += live.cached;
+            totalOutput += live.output;
           }
         }
       }
+    }
+
+    if (latestStepAtMs > lastCompletedAtMs) {
+      lastCompletedAtMs = latestStepAtMs;
+    }
+
+    let lastStepCachedPct = latestTurnTokenUsagePct;
+    let avgStepCachedPct = null;
+    let stepSampleCount = tracker.samples.length;
+    if (stepSampleCount > 0) {
+      lastStepCachedPct = tracker.samples[stepSampleCount - 1].pct;
+      let pctSum = 0;
+      for (let i = 0; i < stepSampleCount; i++) {
+        pctSum += tracker.samples[i].pct;
+      }
+      avgStepCachedPct = Math.round(pctSum / stepSampleCount);
     }
 
     // 收集每轮 run 的开始时间，用于精准计算首字延迟 (TTFT) 及兜底总耗时
@@ -825,7 +949,7 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       for (let i = 0; i < runs.length; i++) {
         const run = runs[i];
         if (!run) continue;
-        const sMs = toEpochMs(run.startedAt ?? run.requestedAt);
+        const sMs = toEpochMs(run.startedAt ?? run.requestedAt ?? run.createdAt);
         const eMs = toEpochMs(run.completedAt);
         if (run.id && Number.isFinite(sMs)) runStartMap.set(run.id, sMs);
         if (Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs) {
@@ -834,21 +958,21 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       }
     }
 
-    // 从 visibleTurnItems 精确拆分「模型用时」「工具调用用时」和「首 token 平均 (TTFT)」
-    let modelDurationMs = 0;
-    let toolDurationMs = 0;
+    // 从 visibleTurnItems 精确拆分「模型用时」「工具调用用时」（区间去重防并行重复计）和「首 token 平均 (TTFT)」
+    const modelIntervals = [];
+    const toolIntervals = [];
     const firstModelStartByRun = new Map();
     if (items && items.length > 0) {
       for (let i = 0; i < items.length; i++) {
         const raw = items[i];
         const it = raw && raw.item ? raw.item : raw;
         if (!it || !it.type) continue;
-        const sMs = toEpochMs(it.startedAt);
+        const sMs = toEpochMs(it.startedAt ?? it.createdAt);
         const eMs = toEpochMs(it.completedAt);
         const dur = Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs ? eMs - sMs : 0;
 
         if (it.type === 'reasoning' || it.type === 'assistant_message') {
-          if (dur > 0 && dur < 3600_000) modelDurationMs += dur;
+          if (dur > 0 && dur < 3600_000) modelIntervals.push([sMs, eMs]);
           if (it.runId && Number.isFinite(sMs)) {
             const prev = firstModelStartByRun.get(it.runId);
             if (prev === undefined || sMs < prev) firstModelStartByRun.set(it.runId, sMs);
@@ -863,10 +987,12 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
           it.type === 'web_search' ||
           it.type === 'subagent'
         ) {
-          if (dur > 0 && dur < 3600_000) toolDurationMs += dur;
+          if (dur > 0 && dur < 3600_000) toolIntervals.push([sMs, eMs]);
         }
       }
     }
+    let modelDurationMs = sumMergedIntervals(modelIntervals);
+    const toolDurationMs = sumMergedIntervals(toolIntervals);
 
     const totalWallMs = totalTurnDurationMs > 0 ? totalTurnDurationMs : totalRunDurationMs;
     if (modelDurationMs === 0 && totalWallMs > 0) {
@@ -917,6 +1043,10 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       totalTokens: hasTurnUsage ? totalInput + totalOutput : null,
       cachePct: hasTurnUsage && totalInput > 0 ? Math.round((totalCachedRead / totalInput) * 100) : null,
       lastTurnCachedPct,
+      lastStepCachedPct,
+      avgStepCachedPct,
+      stepSampleCount,
+      latestStepTokenUsage,
       modelDurationMs: modelDurationMs > 0 ? modelDurationMs : null,
       toolDurationMs: toolDurationMs > 0 ? toolDurationMs : null,
       avgTtftMs,
@@ -991,25 +1121,27 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       }
     }
 
+    // 仅当上游显式上报了 promptCacheExpiresAt / promptCacheTtlMs（如 Claude Code 5m/1h）时才计算精确热/冷倒计时；
+    // Antigravity 等隐式缓存不返回固定 TTL，避免误导性地显示伪造的 5 分钟倒计时
     let ttlRemainMs = null;
     const now = Date.now();
     const expiresAtMs = cw?.promptCacheExpiresAt ? Date.parse(cw.promptCacheExpiresAt) : NaN;
+    const explicitTtlMs = Number.isFinite(cw?.promptCacheTtlMs) && cw.promptCacheTtlMs > 0 ? cw.promptCacheTtlMs : null;
     const updatedAtMs =
       (cw?.updatedAt ? Date.parse(cw.updatedAt) : NaN) ||
       (agg?.lastCompletedAtMs ? agg.lastCompletedAtMs : NaN);
-    const ttlMs = Number.isFinite(cw?.promptCacheTtlMs) && cw.promptCacheTtlMs > 0 ? cw.promptCacheTtlMs : 5 * 60 * 1000;
 
     if (Number.isFinite(expiresAtMs)) {
       ttlRemainMs = expiresAtMs - now;
-    } else if (Number.isFinite(updatedAtMs) && ((cached != null && cached > 0) || (cw && cw.usedTokens > 0))) {
-      ttlRemainMs = updatedAtMs + ttlMs - now;
+    } else if (explicitTtlMs !== null && Number.isFinite(updatedAtMs) && ((cached != null && cached > 0) || (cw && cw.usedTokens > 0))) {
+      ttlRemainMs = updatedAtMs + explicitTtlMs - now;
     }
 
     let state = 'idle';
-    if (cached != null && cached > 0) {
-      state = ttlRemainMs === null || ttlRemainMs > 0 ? 'warm' : 'cold';
-    } else if (ttlRemainMs !== null && ttlRemainMs <= 0 && cw && cw.usedTokens > 0) {
-      state = 'cold';
+    if (ttlRemainMs !== null) {
+      state = ttlRemainMs > 0 ? 'warm' : 'cold';
+    } else if (cached != null && cached > 0) {
+      state = 'active';
     }
 
     return { state, pct, cached, cacheWrite, uncachedInput, outputTokens, reasoningTokens, totalTokens, ttlRemainMs };
@@ -1323,6 +1455,8 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
         '</div>' +
         '<div class="t3-enhancer-pop-divider"></div>' +
         row('累计命中', cachePctStr, cacheCls) +
+        (agg?.lastStepCachedPct != null ? row('本步命中', agg.lastStepCachedPct + '%') : '') +
+        (agg?.avgStepCachedPct != null && agg.stepSampleCount >= 2 ? row('步均命中', agg.avgStepCachedPct + '% (' + agg.stepSampleCount + '步)') : '') +
         (agg?.lastTurnCachedPct != null ? row('上轮命中', agg.lastTurnCachedPct + '%') : '') +
         row('未缓存输入', cache.uncachedInput != null ? cache.uncachedInput.toLocaleString() : '—') +
         row('缓存读取', cache.cached != null ? cache.cached.toLocaleString() : '—') +
@@ -1331,17 +1465,24 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
         (cache.reasoningTokens != null && cache.reasoningTokens > 0 ? row('思考输出', cache.reasoningTokens.toLocaleString()) : '') +
         (costStr ? row('估算费用', costStr) : '');
     } else if (activePopoverKind === 'context') {
-      const maxTokens = cw?.maxTokens && cw.maxTokens > 0 ? cw.maxTokens : null;
-      const usedTokens = cw && Number.isFinite(cw.usedTokens) ? cw.usedTokens : null;
-      const pct = maxTokens && usedTokens != null ? Math.round(cw.usedPercentage ?? (usedTokens / maxTokens) * 100) : null;
+      const stepTu = agg?.latestStepTokenUsage ?? null;
+      const maxTokens =
+        (cw?.maxTokens && cw.maxTokens > 0 ? cw.maxTokens : null) ||
+        (stepTu?.maxTokens && stepTu.maxTokens > 0 ? stepTu.maxTokens : null) ||
+        (st.lastKnownMaxTokens && st.lastKnownMaxTokens > 0 ? st.lastKnownMaxTokens : null);
+      const usedTokens =
+        cw && Number.isFinite(cw.usedTokens)
+          ? cw.usedTokens
+          : (stepTu && Number.isFinite(stepTu.usedTokens) ? stepTu.usedTokens : null);
+      const pct = maxTokens && usedTokens != null ? Math.round(cw?.usedPercentage ?? (usedTokens / maxTokens) * 100) : null;
       const rightSummary =
         usedTokens != null
           ? formatCompact(usedTokens) + (maxTokens ? ' / ' + formatCompact(maxTokens) : '')
           : '—';
 
-      // 分段进度条：按最近一轮缓存命中率估算上下文中的缓存占比（柔和紫） + 非缓存已用段（柔和蓝/告警色）
+      // 分段进度条：优先按最新一步缓存命中率（否则最近一轮 / 累计）估算上下文中的缓存占比（柔和紫） + 非缓存已用段（柔和蓝/告警色）
       const segs = [];
-      const lastHitPct = agg?.lastTurnCachedPct ?? cache.pct;
+      const lastHitPct = agg?.lastStepCachedPct ?? agg?.lastTurnCachedPct ?? cache.pct;
       const cachedInCtxVal =
         usedTokens != null && lastHitPct != null
           ? Math.round((usedTokens * lastHitPct) / 100)
@@ -1532,12 +1673,21 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       }
     }
 
-    // 芯片 3：上下文占用圆环 + 百分比
+    // 芯片 3：上下文占用圆环 + 百分比（cw 缺失 usedTokens 时回退至最新一步 tokenUsage）
     if (chipContextEl) {
+      const stepTu = st.agg?.latestStepTokenUsage ?? null;
+      const effMax =
+        (cw?.maxTokens && cw.maxTokens > 0 ? cw.maxTokens : null) ||
+        (stepTu?.maxTokens && stepTu.maxTokens > 0 ? stepTu.maxTokens : null) ||
+        (st.lastKnownMaxTokens && st.lastKnownMaxTokens > 0 ? st.lastKnownMaxTokens : null);
+      const effUsed =
+        cw && Number.isFinite(cw.usedTokens)
+          ? cw.usedTokens
+          : (stepTu && Number.isFinite(stepTu.usedTokens) ? stepTu.usedTokens : null);
       let pct = null;
       let tone = '';
-      if (cw && Number.isFinite(cw.usedTokens) && cw.maxTokens && cw.maxTokens > 0) {
-        pct = Math.round(cw.usedPercentage ?? (cw.usedTokens / cw.maxTokens) * 100);
+      if (effUsed != null && effMax && effMax > 0) {
+        pct = Math.round(cw?.usedPercentage ?? (effUsed / effMax) * 100);
         if (pct >= 90) tone = 'danger';
         else if (pct >= 80) tone = 'warn';
       }
@@ -1761,6 +1911,10 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       compactHandlerFn = typeof fn === 'function' ? fn : null;
       compactHandlerDisabled = Boolean(disabled);
     },
+    _debugTelemetry(key) {
+      const st = threadTelemetry.get(key || currentThreadKey);
+      return st ? { agg: st.agg, exactRate: st.exactRate, model: st.model } : null;
+    },
     reportThread(threadKey) {
       if (!threadKey || threadKey === currentThreadKey) return;
       currentThreadKey = threadKey;
@@ -1787,7 +1941,14 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
         runlessWorkStartedAt: meta?.runlessWorkStartedAt ?? null,
       };
       if (meta) lastActivityMeta = meta;
-      const st = getOrCreateTelemetry(currentThreadKey);
+      const targetKey =
+        meta && meta.threadId && (currentThreadKey === '__default__' || currentThreadKey.endsWith(String(meta.threadId)))
+          ? currentThreadKey
+          : (meta && meta.threadId ? String(meta.threadId) : currentThreadKey);
+      if (meta && meta.threadId && currentThreadKey === '__default__') {
+        currentThreadKey = String(meta.threadId);
+      }
+      const st = getOrCreateTelemetry(targetKey);
       aggregateThreadData(st, meta);
       if (isWorking && !wasWorking) {
         st.lastSampleNode = null;
@@ -1821,6 +1982,9 @@ html[data-t3-enhancer-live-expand="true"] [data-t3-enhancer-entry-panel="panel"]
       }
       const cw = payload.contextWindow ?? null;
       st.contextWindow = cw;
+      if (cw && Number.isFinite(cw.maxTokens) && cw.maxTokens > 0) {
+        st.lastKnownMaxTokens = cw.maxTokens;
+      }
       if (payload.model !== undefined) st.model = payload.model;
       if (payload.providerInstanceId !== undefined) st.providerInstanceId = payload.providerInstanceId;
 

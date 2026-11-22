@@ -133,27 +133,119 @@ function testRuntimeLogic(inlineScript) {
   assert.equal(api.resolveLiveExpanded('work-group:1', true), true);
   assert.equal(api.toggleLiveExpand(), true);
 
-  // 4) 回归测试：确保内联 Diff 与 providerTurns / items 统计（模型用时、工具用时、TTFT、TPS）无报错且逻辑准确
+  // 4) 回归测试：使用真实 Effect DateTime.Utc 结构（epochMilliseconds + toJSON + DateTime.Utc(...) toString）
+  //    验证模型用时、工具调用用时（含并行区间合并）、TTFT、步级实时累计/去重/均值与内联 Diff
+  const makeEffectUtc = (iso) => {
+    const ms = Date.parse(iso);
+    return {
+      _tag: 'Utc',
+      epochMilliseconds: ms,
+      toJSON: () => new Date(ms).toISOString(),
+      toString: () => `DateTime.Utc(${new Date(ms).toISOString()})`,
+    };
+  };
+  api.reportUsage({
+    threadKey: 'thread-step-test',
+    model: 'gemini-4-neon',
+    contextWindow: { usedTokens: 120000, maxTokens: 1000000 },
+  });
+  const turn1 = {
+    id: 'pt-1',
+    startedAt: makeEffectUtc('2026-11-22T14:00:00.000Z'),
+    completedAt: makeEffectUtc('2026-11-22T14:00:20.000Z'),
+    turnTokenUsage: { inputTokens: 100000, cachedInputTokens: 80000, cacheCreationTokens: 0, outputTokens: 1000, reasoningTokens: 200 },
+  };
+  const turn2Step1 = {
+    id: 'pt-2',
+    status: 'running',
+    startedAt: makeEffectUtc('2026-11-22T14:01:00.000Z'),
+    completedAt: null,
+    tokenUsage: { usedTokens: 100500, maxTokens: 1000000, inputTokens: 100000, cachedInputTokens: 0, outputTokens: 500, updatedAt: '2026-11-22T14:01:05.000Z' },
+  };
+  const turn2Step2 = {
+    id: 'pt-2',
+    status: 'running',
+    startedAt: makeEffectUtc('2026-11-22T14:01:00.000Z'),
+    completedAt: null,
+    tokenUsage: { usedTokens: 110600, maxTokens: 1000000, inputTokens: 110000, cachedInputTokens: 99000, outputTokens: 600, updatedAt: '2026-11-22T14:01:12.000Z' },
+  };
+  const commonRuns = [{ id: 'r1', startedAt: makeEffectUtc('2026-11-22T14:00:00.000Z'), completedAt: makeEffectUtc('2026-11-22T14:00:20.000Z') }];
+  const commonItems = [
+    { item: { type: 'reasoning', runId: 'r1', startedAt: makeEffectUtc('2026-11-22T14:00:02.000Z'), completedAt: makeEffectUtc('2026-11-22T14:00:10.000Z') } },
+    // 两个并行重叠的工具调用（10..15 与 11..16），合并后应为 6 秒而非 10 秒
+    { item: { type: 'command_execution', runId: 'r1', startedAt: makeEffectUtc('2026-11-22T14:00:10.000Z'), completedAt: makeEffectUtc('2026-11-22T14:00:15.000Z') } },
+    { item: { type: 'file_read', runId: 'r1', startedAt: makeEffectUtc('2026-11-22T14:00:11.000Z'), completedAt: makeEffectUtc('2026-11-22T14:00:16.000Z') } },
+    { item: { type: 'assistant_message', runId: 'r1', startedAt: makeEffectUtc('2026-11-22T14:00:16.000Z'), completedAt: makeEffectUtc('2026-11-22T14:00:20.000Z') } },
+  ];
+  api.reportActivity(
+    { isWorking: true },
+    {
+      threadId: 'thread-step-test',
+      phase: 'running',
+      runs: commonRuns,
+      providerTurns: [turn1, turn2Step1],
+      nodes: [{ kind: 'tool_call' }, { kind: 'tool_call' }],
+      items: commonItems,
+    }
+  );
+  // 重复传同一 step 不得重复计数
+  api.reportActivity(
+    { isWorking: true },
+    {
+      threadId: 'thread-step-test',
+      phase: 'running',
+      runs: commonRuns,
+      providerTurns: [turn1, { ...turn2Step1 }],
+      nodes: [{ kind: 'tool_call' }, { kind: 'tool_call' }],
+      items: commonItems,
+    }
+  );
+  // 第 2 步完成
+  api.reportActivity(
+    { isWorking: true },
+    {
+      threadId: 'thread-step-test',
+      phase: 'running',
+      runs: commonRuns,
+      providerTurns: [turn1, turn2Step2],
+      nodes: [{ kind: 'tool_call' }, { kind: 'tool_call' }],
+      items: commonItems,
+    }
+  );
+  const midDebug = api._debugTelemetry?.('thread-step-test');
+  assert.ok(midDebug && midDebug.agg, '应能读取遥测聚合快照');
+  assert.equal(midDebug.agg.modelDurationMs, 12000, '模型用时应正确解析 Effect DateTime.Utc（8s + 4s = 12s）');
+  assert.equal(midDebug.agg.toolDurationMs, 6000, '并行工具用时应按重叠区间合并（6s 而非 10s）');
+  assert.equal(midDebug.agg.avgTtftMs, 2000, '首字平均 TTFT 应为 2000ms');
+  assert.equal(midDebug.agg.lastStepCachedPct, 90, '本步命中应为 99000/110000 = 90%');
+  assert.equal(midDebug.agg.avgStepCachedPct, 45, '两步均值应为 (0% + 90%) / 2 = 45%');
+  assert.equal(midDebug.agg.stepSampleCount, 2, '重复 step 必须被去重，总样本数应为 2');
+  assert.equal(midDebug.agg.totalInput, 310000, '运行中累计输入应实时包含已完成回合 + 活跃回合 2 步');
+  assert.equal(midDebug.agg.totalCachedRead, 179000, '运行中累计缓存读取应为 80000 + 0 + 99000');
+
+  // 回合 2 最终结算，切回权威 turnTokenUsage
   api.reportActivity(
     { isWorking: false },
     {
+      threadId: 'thread-step-test',
       phase: 'idle',
-      runs: [{ id: 'r1', startedAt: '2026-11-22T14:00:00.000Z', completedAt: '2026-11-22T14:00:20.000Z' }],
+      runs: commonRuns,
       providerTurns: [
+        turn1,
         {
-          startedAt: '2026-11-22T14:00:00.000Z',
-          completedAt: '2026-11-22T14:00:20.000Z',
-          turnTokenUsage: { inputTokens: 100000, cachedInputTokens: 80000, cacheCreationTokens: 0, outputTokens: 1000, reasoningTokens: 200 },
+          ...turn2Step2,
+          status: 'completed',
+          completedAt: makeEffectUtc('2026-11-22T14:01:15.000Z'),
+          turnTokenUsage: { inputTokens: 210000, cachedInputTokens: 99000, cacheCreationTokens: 0, outputTokens: 1100, reasoningTokens: 100 },
         },
       ],
       nodes: [{ kind: 'tool_call' }, { kind: 'tool_call' }],
-      items: [
-        { item: { type: 'reasoning', runId: 'r1', startedAt: '2026-11-22T14:00:02.000Z', completedAt: '2026-11-22T14:00:10.000Z' } },
-        { item: { type: 'command_execution', runId: 'r1', startedAt: '2026-11-22T14:00:10.000Z', completedAt: '2026-11-22T14:00:15.000Z' } },
-        { item: { type: 'assistant_message', runId: 'r1', startedAt: '2026-11-22T14:00:15.000Z', completedAt: '2026-11-22T14:00:20.000Z' } },
-      ],
+      items: commonItems,
     }
   );
+  const endDebug = api._debugTelemetry?.('thread-step-test');
+  assert.equal(endDebug.agg.totalInput, 310000, '回合结算后不得重复累加活跃步级缓存');
+  assert.equal(endDebug.agg.totalCachedRead, 179000, '回合结算后缓存读取应与权威值一致');
   const fakeJsx = { jsx: (type, props, key) => ({ type, props, key }) };
   const diffNode = api.renderInlineDiff(fakeJsx, { diffStr: '@@ -1,2 +1,2 @@\n-old\n+new' });
   assert.ok(diffNode && diffNode.props.children.length === 3, 'renderInlineDiff 应正确解析 hunk / del / add 行');
@@ -209,11 +301,11 @@ async function main() {
   // 4. dry-run 全模块体检
   const dryReport = await runPatch({ app: appPath, dryRun: true, strictUpdater: true });
   assert.equal(dryReport.ok, true);
-  assert.equal(dryReport.modules.length, 4);
+  assert.equal(dryReport.modules.length, 5);
   for (const m of dryReport.modules) {
     assert.equal(m.status, 'ok', `模块 ${m.id} dry-run 必须为 ok`);
   }
-  console.log('[check] ✓ 全部 4 个模块 dry-run 锚点体检通过');
+  console.log('[check] ✓ 全部 5 个模块 dry-run 锚点体检通过');
 
   // 5. 在隔离临时目录中用 APFS cp -c -R 克隆完整 .app 执行真实补丁、语法校验与重签名校验
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 't3code-enhancer-e2e-'));
@@ -247,7 +339,7 @@ async function main() {
         const content = patchedArchive.readText(relPath);
         if (relPath.endsWith('.cjs')) {
           checkJsSyntax(content, relPath, false);
-        } else if (relPath.endsWith('.js')) {
+        } else if (relPath.endsWith('.js') || relPath.endsWith('.mjs')) {
           checkJsSyntax(content, relPath, true);
           // 回归防线：禁止出现 useEffect(...), 破坏原 comma-let 声明链导致 Assignment to constant variable
           assert.equal(

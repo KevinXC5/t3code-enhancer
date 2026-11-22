@@ -9,7 +9,7 @@
 无缝嵌入编辑框下方的原生上下文栏（`[data-slot="composer-context-strip"]`）中间空白区域，高度、字号、图标与 Hover 主题高亮（`--app-theme-accent-surface`）与原生 `main` 分支按钮完全对齐，支持任意内置与第三方深浅主题：
 
 * **会话统计与输出速率**：显示 `N 轮 M 步 · xx tok/s`。流式生成期间采用混合模式按末尾字符增量实时估算（`~xx tok/s`），回合结束或收到正式统计后切换为精确值；悬停弹出「**会话统计**」卡片，展示模型用时、工具调用用时、首字平均（TTFT）、输出速度（TPS）与当前模型。
-* **用量与缓存命中**：聚合当前会话所有 `providerTurns` 的真实 `turnTokenUsage`，显示总用量与缓存命中率；悬停弹出「**用量统计**」卡片，展示累计命中（含热/冷 TTL 剩余时间）、上轮命中、未缓存输入、缓存读取、缓存写入、输出、思考输出与估算费用。
+* **用量与步级实时缓存命中**：聚合当前会话所有 `providerTurns` 的真实用量，并在运行期按步级 `tokenUsage` 实时累加（Claude Code / Codex / OpenCode 使用原生步级事件，Antigravity 由服务端增量读取 `transcript.jsonl` 桥接至原生 `tokenUsage`）。底栏实时显示总用量与累计缓存命中（token 加权）；悬停弹出「**用量统计**」卡片，展示累计命中（provider 显式上报 TTL 时附带热/冷倒计时）、本步命中、步均命中、上轮命中、未缓存输入、缓存读取、缓存写入、输出、思考输出与估算费用。
 * **上下文占用进度环与一键压缩**：以圆形进度环展示当前上下文占用百分比（≥80% 琥珀色、≥90% 红色）；悬停弹出「**上下文已用**」卡片，含彩色分段进度条、缓存/非缓存/剩余明细、自动压缩阈值，以及直接调用原生 `/compact` 的「**压缩上下文**」按钮。
 
 ### 2. 流式工作组自动展开、固定高度与内联红绿 Diff
@@ -65,11 +65,10 @@ node test/dry-run-check.mjs
 
 ### 3. 安装补丁
 
-先完全退出 T3 Code（`Cmd + Q`），然后在终端执行：
+在系统终端执行（若 T3 Code 正在运行，脚本会自动提示并优雅退出，安装完成后自动重新打开）：
 
 ```bash
 ./install.sh
-open -a "T3 Code (Nightly)"
 ```
 
 * 首次安装会自动通过 APFS `cp -c -R`（写时复制，几乎零额外磁盘占用）将官方原厂签名应用完整备份至 `~/.t3/enhancer/backups/`。
@@ -77,7 +76,7 @@ open -a "T3 Code (Nightly)"
 
 ### 4. 一键还原官方原厂签名版
 
-退出 T3 Code 后执行：
+在系统终端执行（同样会自动检测、退出运行中的 T3 Code，还原完成后自动重新打开）：
 
 ```bash
 ./uninstall.sh
@@ -140,6 +139,7 @@ t3code-enhancer/
 │       ├── head-runtime.mjs      # index.html 全局样式、运行时总线、状态栏与内联 Diff 渲染
 │       ├── live-expand.mjs       # 流式自动展开、单条固定高度滚底与编辑详情按需加载
 │       ├── composer-status.mjs   # 当前会话用量、轮次、工具节点与 /compact 单点桥接
+│       ├── step-usage-bridge.mjs # 服务端 Antigravity transcript.jsonl 步级缓存/用量实时桥接
 │       └── mac-updater-hook.mjs  # MacUpdater 自动升级拦截 Hook
 └── test/
     └── dry-run-check.mjs         # 端到端无侵入体检与回归自测套件

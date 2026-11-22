@@ -10,6 +10,7 @@ CONFIG_PATH="${ENHANCER_HOME}/config.json"
 
 APP_PATH=""
 DRY_RUN=0
+NO_REOPEN=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -23,9 +24,13 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS+=("--dry-run")
       shift
       ;;
+    --no-reopen)
+      NO_REOPEN=1
+      shift
+      ;;
     -h|--help)
       cat <<'EOF'
-用法: ./install.sh [--app "/Applications/T3 Code (Nightly).app"] [--dry-run] [其他 patch-all.mjs 参数]
+用法: ./install.sh [--app "/Applications/T3 Code (Nightly).app"] [--dry-run] [--no-reopen] [其他 patch-all.mjs 参数]
 EOF
       exit 0
       ;;
@@ -86,10 +91,66 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
-# 检查目标应用是否处于运行状态（给出提示，防止覆盖正在加载的 asar 引发异常）
-if pgrep -f "${APP_PATH}/Contents/MacOS/" >/dev/null 2>&1; then
-  echo "[t3code-enhancer] 提示：检测到 ${APP_NAME} 正在运行。建议先完全退出应用后再安装，安装完成后重新打开。" >&2
-fi
+# 检测目标应用是否正在运行，若运行中则提示并自动优雅退出，安装完成后再自动打开
+APP_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${APP_PATH}/Contents/Info.plist" 2>/dev/null || true)"
+WAS_RUNNING=0
+
+get_app_pids() {
+  # 仅匹配真正以目标 .app/Contents/MacOS/ 为可执行文件前缀的进程，避免匹配到 awk 或命令行参数中包含路径的无关进程
+  ps -ax -o pid=,command= | awk -v prefix="${APP_PATH}/Contents/MacOS/" '
+    {
+      pid = $1
+      cmd = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
+      if (substr(cmd, 1, length(prefix)) == prefix) print pid
+    }
+  '
+}
+
+is_app_running() {
+  [[ -n "$(get_app_pids)" ]]
+}
+
+quit_app_if_running() {
+  if ! is_app_running; then
+    return 0
+  fi
+  WAS_RUNNING=1
+  echo "[t3code-enhancer] 检测到 ${APP_NAME} 正在运行，需要先退出应用后再安装，正在自动退出..."
+  if [[ -n "${APP_BUNDLE_ID}" ]]; then
+    osascript -e "tell application id \"${APP_BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
+  else
+    osascript -e "tell application \"${APP_NAME}\" to quit" >/dev/null 2>&1 || true
+  fi
+
+  local waited=0
+  while is_app_running && [[ "${waited}" -lt 25 ]]; do
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+
+  if is_app_running; then
+    echo "[t3code-enhancer] 正在结束残留的后台服务进程..."
+    local pids
+    pids="$(get_app_pids)"
+    if [[ -n "${pids}" ]]; then
+      kill -TERM ${pids} >/dev/null 2>&1 || true
+    fi
+    waited=0
+    while is_app_running && [[ "${waited}" -lt 20 ]]; do
+      sleep 0.2
+      waited=$((waited + 1))
+    done
+  fi
+
+  if is_app_running; then
+    echo "[t3code-enhancer] 无法自动退出 ${APP_NAME}，请手动退出（Cmd + Q）后重试。" >&2
+    exit 1
+  fi
+  echo "[t3code-enhancer] ${APP_NAME} 已退出，继续执行安装..."
+}
+
+quit_app_if_running
 
 mkdir -p "${BACKUPS_DIR}"
 
@@ -155,3 +216,7 @@ else
   run_node "${REPO_DIR}/scripts/patch-all.mjs" --app "${APP_PATH}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi
 echo "[t3code-enhancer] 安装完成。原厂还原可执行: ${REPO_DIR}/uninstall.sh"
+if [[ "${WAS_RUNNING}" -eq 1 && "${NO_REOPEN}" -eq 0 ]]; then
+  echo "[t3code-enhancer] 正在重新打开 ${APP_NAME}..."
+  open "${APP_PATH}"
+fi
