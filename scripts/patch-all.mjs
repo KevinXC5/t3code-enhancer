@@ -12,6 +12,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+if (typeof process !== 'undefined' && process.versions?.electron) {
+  process.noAsar = true;
+}
 import { AsarArchive, updatePlistAsarIntegrity, verifyAsar } from './asar-lib.mjs';
 import {
   codesignApp,

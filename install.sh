@@ -66,6 +66,7 @@ if [[ -z "${APP_PATH}" || ! -d "${APP_PATH}" ]]; then
 fi
 
 # 解析 Node 运行时：优先系统 node，否则回退应用内置 Electron（ELECTRON_RUN_AS_NODE=1）
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 run_node() {
   if command -v node >/dev/null 2>&1; then
     node "$@"

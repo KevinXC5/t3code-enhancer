@@ -7,6 +7,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readPlistAsarIntegrity } from './asar-lib.mjs';
 
+if (typeof process !== 'undefined' && process.versions?.electron) {
+  process.noAsar = true;
+}
+
 export const ENHANCER_HOME = path.join(os.homedir(), '.t3', 'enhancer');
 export const CONFIG_PATH = path.join(ENHANCER_HOME, 'config.json');
 export const BACKUPS_DIR = path.join(ENHANCER_HOME, 'backups');

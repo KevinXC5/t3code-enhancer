@@ -160,6 +160,7 @@ if [[ "${AUTO_PULL}" == "1" && -d "${REPO_DIR}/.git" ]]; then
 fi
 
 # 查找 Node 或内置 Electron 运行时
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 run_node() {
   if command -v node >/dev/null 2>&1; then
     node "$@"

@@ -7,6 +7,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
+// 在 ELECTRON_RUN_AS_NODE=1 环境下关闭 Electron 的 ASAR 虚拟文件系统拦截，保证可直接按普通文件读写 app.asar
+if (typeof process !== 'undefined' && process.versions?.electron) {
+  process.noAsar = true;
+}
+
 export const DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MiB，与 @electron/asar 默认分块一致
 
 /**
