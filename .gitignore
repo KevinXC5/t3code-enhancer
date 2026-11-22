@@ -1,0 +1,8 @@
+.DS_Store
+*.tmp
+*.log
+*.p12
+*.key
+*.crt
+tmp/
+backups/
