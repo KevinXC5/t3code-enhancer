@@ -54,12 +54,13 @@ export function apply(ctx) {
     'A1(usage contextWindow bridge)'
   );
 
-  // A2：在会话活跃运行态计算处同步 isWorking / phase / 线程 id、runs、providerTurns、nodes 与 visibleTurnItems（供精确计算模型用时、工具用时、TTFT 与步级实时缓存命中）
+  // A2：在会话活跃运行态计算处同步 isWorking / phase / 线程 id、runs、providerTurns、nodes 与 visibleTurnItems
+  // 锚定到后续稳定的 `([items]??[],...)` 与 `fn(threadObj)` 参数，兼容 5085 / 5098 及后续上游重构
   code = replaceOnce(
     code,
-    /(run:([$\w]+)\?\.runs\.find\([^)]+\),messages:\2\?\.messages\}\),[$\w]+)(=)([$\w]+)\(\{phase:([$\w]+),isSendBusy:([$\w]+),isCompacting:([$\w]+),runlessWorkStartedAt:([$\w]+)\}\)(,[$\w]+=[$\w]+\(([$\w]+)\?\?\[\],)/g,
-    (_, prefix, threadObjVar, eq, fnVar, phaseVar, busyVar, compactVar, startedVar, tail, itemsVar) =>
-      `${prefix}${eq}(__r=>(window.__t3Enhancer?.reportActivity?.(__r,{threadId:${threadObjVar}?.id,phase:${phaseVar},isSendBusy:${busyVar},isCompacting:${compactVar},runlessWorkStartedAt:${startedVar},runs:${threadObjVar}?.runs,providerTurns:${threadObjVar}?.providerTurns,nodes:${threadObjVar}?.nodes,items:${itemsVar}}),__r))(${fnVar}({phase:${phaseVar},isSendBusy:${busyVar},isCompacting:${compactVar},runlessWorkStartedAt:${startedVar}}))${tail}`,
+    /(,[$\w]+=)([$\w]+)\(\{phase:([$\w]+),isSendBusy:([$\w]+),isCompacting:([$\w]+),runlessWorkStartedAt:([$\w]+)\}\)(,[$\w]+=[$\w]+\(([$\w]+)\?\?\[\],[^)]+\),[$\w]+=[$\w]+\(([$\w]+)\))/g,
+    (_, prefix, fnVar, phaseVar, busyVar, compactVar, startedVar, tail, itemsVar, threadObjVar) =>
+      `${prefix}(__r=>(window.__t3Enhancer?.reportActivity?.(__r,{threadId:${threadObjVar}?.id,phase:${phaseVar},isSendBusy:${busyVar},isCompacting:${compactVar},runlessWorkStartedAt:${startedVar},runs:${threadObjVar}?.runs,providerTurns:${threadObjVar}?.providerTurns,nodes:${threadObjVar}?.nodes,items:${itemsVar}}),__r))(${fnVar}({phase:${phaseVar},isSendBusy:${busyVar},isCompacting:${compactVar},runlessWorkStartedAt:${startedVar}}))${tail}`,
     'A2(activity state & thread turns/nodes/items bridge)'
   );
 

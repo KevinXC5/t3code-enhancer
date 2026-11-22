@@ -8,6 +8,8 @@
 #   5. 对新版副本重打补丁；若核心锚点失配或异常则自动降级安装干净官方新版
 #   6. 原子替换目标 .app 并重新拉起应用
 set -euo pipefail
+# 忽略父进程退出可能传播的 HUP/TERM 信号，避免升级中途被回收打断
+trap '' HUP TERM
 
 ENHANCER_HOME="${HOME}/.t3/enhancer"
 CONFIG_PATH="${ENHANCER_HOME}/config.json"
@@ -27,6 +29,8 @@ TARGET_APP=""
 WAIT_PID=""
 RELAUNCH="1"
 DRY_RUN="0"
+LAUNCHD_LABEL=""
+LAUNCHD_PLIST=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,6 +54,14 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN="1"
       shift
       ;;
+    --launchd-label)
+      LAUNCHD_LABEL="$2"
+      shift 2
+      ;;
+    --launchd-plist)
+      LAUNCHD_PLIST="$2"
+      shift 2
+      ;;
     *)
       log "忽略未知参数: $1"
       shift
@@ -68,7 +80,18 @@ if [[ -z "${TARGET_APP}" ]]; then
   exit 1
 fi
 
-# 1. 等待旧进程完全退出（最长 45 秒）
+# 1. 等待旧进程及残留子服务完全退出（最长 45 秒）
+get_target_app_pids() {
+  ps -ax -o pid=,command= | awk -v prefix="${TARGET_APP}/Contents/MacOS/" '
+    {
+      pid = $1
+      cmd = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
+      if (substr(cmd, 1, length(prefix)) == prefix) print pid
+    }
+  '
+}
+
 if [[ -n "${WAIT_PID}" ]]; then
   log "等待旧进程 PID=${WAIT_PID} 退出..."
   for _ in $(seq 1 90); do
@@ -81,8 +104,20 @@ if [[ -n "${WAIT_PID}" ]]; then
     log "警告：旧进程 PID=${WAIT_PID} 超过 45 秒仍未退出，终止本次替换以防损坏。"
     exit 1
   fi
-  # 给文件句柄释放一点缓冲时间
-  sleep 0.5
+  # 等待应用内置后台服务进程一并退出，避免替换 app.asar 时存在句柄占用
+  for _ in $(seq 1 15); do
+    if [[ -z "$(get_target_app_pids)" ]]; then
+      break
+    fi
+    sleep 0.3
+  done
+  REM_PIDS="$(get_target_app_pids)"
+  if [[ -n "${REM_PIDS}" ]]; then
+    log "结束残留后台服务进程: ${REM_PIDS}"
+    kill -TERM ${REM_PIDS} 2>/dev/null || true
+    sleep 0.8
+  fi
+  sleep 0.3
 fi
 
 # 2. 创建临时工作区并解压官方 update.zip
@@ -91,6 +126,12 @@ EXTRACT_DIR="${WORK_DIR}/extract"
 mkdir -p "${EXTRACT_DIR}"
 cleanup() {
   rm -rf "${WORK_DIR}"
+  if [[ -n "${LAUNCHD_PLIST}" && -f "${LAUNCHD_PLIST}" ]]; then
+    rm -f "${LAUNCHD_PLIST}" 2>/dev/null || true
+  fi
+  if [[ -n "${LAUNCHD_LABEL}" ]]; then
+    (sleep 1; /bin/launchctl bootout "gui/$(id -u)/${LAUNCHD_LABEL}" >/dev/null 2>&1 || true) &
+  fi
 }
 trap cleanup EXIT
 

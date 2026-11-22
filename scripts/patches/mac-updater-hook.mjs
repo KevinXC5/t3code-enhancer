@@ -98,19 +98,53 @@ export function apply(ctx) {
 				// 从 Contents/MacOS/<binary> 向上三级推导当前 .app 包路径
 				const currentAppPath = __t3path.resolve(process.execPath, "..", "..", "..");
 				const relaunch = this.autoRunAppAfterInstall ? "1" : "0";
-				this._logger.info(\`[t3code-enhancer] Spawning update helper: \${helperPath} --zip \${zipPath} --app \${currentAppPath} --pid \${process.pid} --relaunch \${relaunch}\`);
-				const child = __t3cp.spawn("/bin/bash", [
+				const logsDir = __t3path.join(__t3os.homedir(), ".t3", "enhancer", "logs");
+				__t3fs.mkdirSync(logsDir, { recursive: true });
+				const jobId = \`\${Date.now()}-\${process.pid}\`;
+				const jobLabel = \`com.t3code.enhancer.update.\${jobId}\`;
+				const plistPath = __t3path.join(logsDir, \`\${jobLabel}.plist\`);
+				const helperArgs = [
+					"/bin/bash",
 					helperPath,
 					"--zip", zipPath,
 					"--app", currentAppPath,
 					"--pid", String(process.pid),
-					"--relaunch", relaunch
-				], {
-					detached: true,
-					stdio: "ignore",
-					env: { ...process.env }
-				});
-				child.unref();
+					"--relaunch", relaunch,
+					"--launchd-label", jobLabel,
+					"--launchd-plist", plistPath
+				];
+				let launchedViaLaunchd = false;
+				if (typeof process.getuid === "function") {
+					try {
+						const xmlEsc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+						const progXml = helperArgs.map((a) => \`\\t\\t<string>\${xmlEsc(a)}</string>\`).join("\\n");
+						const envPairs = [];
+						for (const k of ["PATH", "HOME", "USER", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]) {
+							if (process.env[k]) {
+								envPairs.push(\`\\t\\t<key>\${xmlEsc(k)}</key>\\n\\t\\t<string>\${xmlEsc(process.env[k])}</string>\`);
+							}
+						}
+						const envXml = envPairs.length > 0 ? \`\\n\\t<key>EnvironmentVariables</key>\\n\\t<dict>\\n\${envPairs.join("\\n")}\\n\\t</dict>\` : "";
+						const plistXml = \`<?xml version="1.0" encoding="UTF-8"?>\\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\\n<plist version="1.0">\\n<dict>\\n\\t<key>Label</key>\\n\\t<string>\${xmlEsc(jobLabel)}</string>\\n\\t<key>ProgramArguments</key>\\n\\t<array>\\n\${progXml}\\n\\t</array>\${envXml}\\n\\t<key>RunAtLoad</key>\\n\\t<true/>\\n\\t<key>AbandonProcessGroup</key>\\n\\t<true/>\\n</dict>\\n</plist>\\n\`;
+						__t3fs.writeFileSync(plistPath, plistXml, "utf8");
+						const uid = process.getuid();
+						__t3cp.execFileSync("/bin/launchctl", ["bootstrap", \`gui/\${uid}\`, plistPath], { stdio: "ignore", timeout: 5000 });
+						launchedViaLaunchd = true;
+						this._logger.info(\`[t3code-enhancer] Submitted isolated launchd update job: \${jobLabel}\`);
+					} catch (ldErr) {
+						try { __t3fs.unlinkSync(plistPath); } catch {}
+						this._logger.warn(\`[t3code-enhancer] launchctl bootstrap failed, fallback to detached spawn: \${ldErr && ldErr.message ? ldErr.message : ldErr}\`);
+					}
+				}
+				if (!launchedViaLaunchd) {
+					this._logger.info(\`[t3code-enhancer] Spawning detached update helper: \${helperPath}\`);
+					const child = __t3cp.spawn("/bin/bash", helperArgs.slice(1), {
+						detached: true,
+						stdio: "ignore",
+						env: { ...process.env }
+					});
+					child.unref();
+				}
 				this.closeServerIfExists();
 				this.app.quit();
 				return true;
