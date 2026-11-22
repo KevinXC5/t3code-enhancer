@@ -274,13 +274,18 @@ async function main() {
   }
   console.log('[check] ✓ Shell 脚本语法校验通过');
 
-  // 2. Chromium Pickle 4 字节对齐与 SHA-256 分块校验
+  // 2. Chromium Pickle 4 字节对齐与 SHA-256 分块校验（覆盖 strLen % 4 === 0,1,2,3 全部情况）
   for (let pad = 0; pad < 4; pad += 1) {
     const obj = { files: { ['a'.repeat(pad + 1)]: { size: 0, offset: '0' } } };
     const { prefixBuf, headerPickleSize, headerString } = createAsarHeaderPickle(obj);
+    const strLen = Buffer.byteLength(headerString, 'utf8');
+    const alignedStrLen = (strLen + 3) & ~3;
     assert.equal(prefixBuf.length % 4, 0);
     assert.equal(prefixBuf.length, 8 + headerPickleSize);
-    assert.equal(prefixBuf.readUInt32LE(12), Buffer.byteLength(headerString, 'utf8'));
+    assert.equal(prefixBuf.readUInt32LE(4), headerPickleSize);
+    assert.equal(prefixBuf.readUInt32LE(8), 4 + alignedStrLen, 'Chromium Pickle payloadSize 必须为 4 + alignedStrLen');
+    assert.equal(headerPickleSize - prefixBuf.readUInt32LE(8), 4, 'headerPickleSize 必须等于 headerPayloadSize + 4');
+    assert.equal(prefixBuf.readUInt32LE(12), strLen);
   }
   const emptyIntegrity = computeFileIntegrity(Buffer.alloc(0));
   assert.equal(emptyIntegrity.blocks.length, 1);

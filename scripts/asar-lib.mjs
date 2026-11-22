@@ -55,10 +55,10 @@ export function createAsarHeaderPickle(headerObj) {
   const headerString = JSON.stringify(headerObj);
   const strBuf = Buffer.from(headerString, 'utf8');
   const strLen = strBuf.length;
-  // Chromium Pickle 写入 string 后按 4 字节边界补零
+  // Chromium base::Pickle 写入 string 后按 4 字节边界补零，payloadSize 必须包含补零字节（即 4 + alignedStrLen）
   const alignedStrLen = (strLen + 3) & ~3;
-  const headerPayloadSize = 4 + strLen;
-  const headerPickleSize = 4 + 4 + alignedStrLen; // payloadSize(4) + strLen(4) + alignedStr
+  const headerPayloadSize = 4 + alignedStrLen;
+  const headerPickleSize = 4 + headerPayloadSize; // payloadSize(4) + strLen(4) + alignedStr
 
   const prefixBuf = Buffer.alloc(8 + headerPickleSize, 0);
   prefixBuf.writeUInt32LE(4, 0);
